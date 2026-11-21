@@ -981,12 +981,20 @@ class Bot:
         # Both angles must fit the observed target, including at point-blank range.
         pitch_tol = math.atan2(info["h"] * 0.8, max(d, 1.0))
         on = yaw_err < tol and pitch_err < pitch_tol
+        # Gun gate at fire time. self.aim is one decision behind a moving lead point,
+        # but the torso slews turn_rate/tick_hz per tick toward the aim we send now.
+        # So fire when one tick of slew puts the torso within tolerance of the
+        # solution. Far-off aims still hold fire until the torso arrives.
+        mech = self.cfg["mech"]
+        tick = 1.0 / self.cfg["match"]["tick_hz"]
+        turn = self.stats.get("turn_rate", mech["turn_rate"]) * tick
+        prate = self.stats.get("pitch_rate", mech["pitch_rate"]) * tick
+        gun_on = yaw_err < tol + turn and pitch_err < pitch_tol + prate
         if should:
             if gun and info["vis"] and d < gun[1]["stats"].get("range", 230) and mode == "gun":
                 gw = gun[1]
                 if gw.get("ammo", 1) > 0 and gw.get("reload", 0) == 0:
-                    # direct check of where the bullet goes now (current aim) vs the lead point
-                    if on:
+                    if gun_on:
                         fire[gun[0]] = True
             if use_mortar and yaw_err < 0.03 and pitch_err < 0.02:
                 fire[mortar[0]] = True
@@ -1017,7 +1025,7 @@ class Bot:
                 elif lw.get("cooldown", 0) <= 0 and d < rng * 0.95 and info["vis"] and yaw_err < 0.5:
                     fire[li] = True        # start charging
         elif farm:
-            if gun and d < 90 and on:
+            if gun and d < 90 and gun_on:
                 gw = gun[1]
                 if gw.get("ammo", 1) > 0 and gw.get("reload", 0) == 0:
                     fire[gun[0]] = True
