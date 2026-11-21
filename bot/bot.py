@@ -95,6 +95,7 @@ class Bot:
         self.scan_yaw = None
         self.mode = "start"
         self.bad_pickups = {}
+        self.seen_pickups = {}
         self.bad_crates = set()
         self.focus_id = None
         self.focus_t = -99.0
@@ -121,6 +122,12 @@ class Bot:
         self._events(obs)
         self._sounds(obs)
         self._track(obs)
+        # Ground weapons stay put when the torso turns away. Forget stale
+        # sightings and anything missing when we reach its collection radius.
+        visible = {p["id"]: p for p in obs.get("pickups") or []}
+        self.seen_pickups = {i: (pk, seen) for i, (pk, seen) in self.seen_pickups.items()
+                             if t - seen < 12 and dist2(self.pos, pk["pos"]) > self.pickup_r}
+        self.seen_pickups.update((i, (pk, t)) for i, pk in visible.items())
         if obs.get("offer"):
             act["pick"] = self._pick_upgrade(obs["offer"])
 
@@ -310,12 +317,12 @@ class Bot:
                 continue
             if math.hypot(x - cc[0], y - cc[1]) > cr - 4:
                 continue
-            s = wm.cover(idx)
+            s = wm.cover(idx) * 2.5 - r * 0.15 - wm.pen[idx] * 0.5
             if my_comp and wm.comp[idx] != my_comp:
-                s -= 30.0          # reachable only by jetting over walls * 2.5 - r * 0.15 - (wm.pen[idx] * 0.5)
+                s -= 100.0  # prefer a walking route anywhere inside the next circle
             if s > bs:
                 bs, best = s, (x, y)
-        if (best is None or bs < -50) and my_comp and nr > 0:
+        if my_comp and nr > 0 and (best is None or wm.comp[wm.idx(*best)] != my_comp):
             # nothing reachable near the ideal spot: closest same-region cell inside the circle
             for k in range(80):
                 a = self.rng.random() * TAU
@@ -426,7 +433,10 @@ class Bot:
         goal = self._loot_goal(obs, threats, eta, need)
         if goal is not None:
             self.mode = "LOOT"
-            return self._navigate(goal[:2], arrive=0.6), False, False, "loot " + goal[2]
+            # Spend surplus ground energy to fill the empty weapon slot early.
+            equip = len(self.slots) == 1 and goal[2] in WEAPON_VALUE
+            sprint = equip and me["grounded"] and me["energy"] > me["max_energy"] * 0.6 and dist2(p, goal) > walk
+            return self._navigate(goal[:2], arrive=0.6), sprint, False, "loot " + goal[2]
 
         self.mode = "HOLD"
         if d_safe < 3.0:
@@ -561,7 +571,10 @@ class Bot:
             if k != "gun":
                 cur2 = k
         cur_v = WEAPON_VALUE.get(cur2, 0.0) if cur2 else 0.0
-        for pk in obs.get("pickups") or []:
+        weapon_range = max_d
+        if cur2 is None and not late:
+            weapon_range = min(self.cfg["vision"]["range"], spare * self.stats["walk_speed"] * 0.7)
+        for pk, seen in self.seen_pickups.values():
             if pk["id"] in self.bad_pickups and t - self.bad_pickups[pk["id"]] < 5:
                 continue
             kind = pk.get("kind")
@@ -571,9 +584,12 @@ class Bot:
             if gain < 0.5:
                 continue
             d = dist2(self.pos, pk["pos"])
-            if d > max_d or abs(pk["pos"][2] - pz) > 4:
+            # The four-metre vertical limit applies at collection. Compare with
+            # terrain at the item to distinguish distant slopes from rooftops.
+            if d > weapon_range or (abs(pk["pos"][2] - pz) > 4
+                                    and abs(pk["pos"][2] - self.wm.ground[self.wm.idx(*pk["pos"][:2])]) > 4):
                 continue
-            s = gain * 30 / (1 + d / 25)
+            s = gain * 30 / (1 + d / 25) / (1 + (t - seen) / 12)
             if danger_near:
                 s *= 0.4
             if s > bs:
@@ -668,7 +684,7 @@ class Bot:
             self.path_goal = (gx, gy)
             self.path_t = self.t
         if self.job is not None and not self.job.done:
-            if self.job.step(4000, deadline=self.deadline):
+            if self.job.step(600, deadline=self.deadline):
                 end = self.job.path[-1]
                 ex, ey = wm.center(end)
                 if math.hypot(ex - gx, ey - gy) > 8 and self.job.climb < 40:
@@ -679,6 +695,10 @@ class Bot:
                     self.path_i = 0
         if self.path:
             return self._follow()
+        # Keep the search origin valid while planning around a wall. Walking
+        # straight at a blocked goal can strand us on the wrong side of the route.
+        if self.job and not self.job.done and not wm.walk_line(px, py, gx, gy):
+            return (0.0, 0.0)
         return self._steer_free(unit(gx - px, gy - py))
 
     def _follow(self):
@@ -791,8 +811,20 @@ class Bot:
                 return self._steer_free((ux, uy)), self.me["energy"] > 10
         # charging laser pointed at us: sidestep
         for e in self.threats:
-            if e["charging"] and e["aim_err"] < 0.2 and e["d"] < 280:
+            if e["charging"] and e["aim_err"] < 0.2 and e["d"] < self.W["laser"]["range"]:
                 ex, ey = e["e"]["pos"][0], e["e"]["pos"][1]
+                # A sidestep in the open still leaves a hitscan shot. Prefer a
+                # short walkable route that actually puts geometry in the beam.
+                if self.mode in ("FIGHT", "RETREAT") and not self.nav_boost:
+                    cover = self._hide_spot([e], obs["zone"])
+                    reach = self.stats["boost_speed"] * self.W["laser"]["charge"]
+                    if cover and dist2(self.pos, cover) <= reach and self.wm.walk_line(px, py, *cover):
+                        muzzle = e["e"]["pos"][2] + self.cfg["mech"]["muzzle_height"] * e["size"]
+                        head = self.wm.surface(*cover) + self.stats["height"]
+                        if not self.wm.los(ex, ey, muzzle, *cover, head):
+                            return unit(cover[0] - px, cover[1] - py), self.me["grounded"] and self.me["energy"] > 20
+                if self.nav_boost or self.mode == "ZONE":
+                    return mv, boost  # preserve a climb or urgent zone route
                 ux, uy = unit(ex - px, ey - py)
                 sx, sy = -uy * self.strafe, ux * self.strafe
                 return self._steer_free((sx, sy)), self.me["energy"] > 20
