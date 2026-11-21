@@ -1016,7 +1016,8 @@ class Bot:
                 rng = st.get("range", 280)
                 if charge > 0:
                     held_too_long = charge >= full + st.get("hold_s", 2.0) * 0.7
-                    if charge >= full and (on or held_too_long):
+                    if charge >= full and (self._beam_on(cur, aim_yaw, aim_pitch, tp, tv, tol, pitch_tol, turn, prate)
+                                           or held_too_long):
                         fire[li] = False   # release: fires now along our actual aim
                     elif not info["vis"] and charge >= full and yaw_err > 0.3:
                         fire[li] = False
@@ -1037,6 +1038,27 @@ class Bot:
         if laser and not fire[laser[0]] and (laser[1].get("charge", 0) or 0) > 0 and not should:
             fire[laser[0]] = (laser[1].get("charge", 0) or 0) < laser[1]["stats"].get("charge", 0.75)
         return [aim_yaw, aim_pitch], fire, reload
+
+    def _beam_on(self, cur, aim_yaw, aim_pitch, tp, tv, tol, pitch_tol, turn, prate):
+        """Will a laser released now hit? Letting go applies on the next tick, and the
+        protocol doesn't say whether the torso slews before or after it. So require a
+        hit both along the current aim and along the aim after one tick of slew toward
+        the command, against the target where it will be at release (relative motion).
+        The old check compared the aim to the 0.1 s lead point, so it held a ready shot
+        while the target moved fast."""
+        tick = 1.0 / self.cfg["match"]["tick_hz"]
+        px, py, pz = self.pos
+        mz = pz + self.stats.get("muzzle_height", 7.0)
+        sv = self.me.get("vel") or (0.0, 0.0, 0.0)
+        rx = tp[0] + (tv[0] - sv[0]) * tick - px
+        ry = tp[1] + (tv[1] - sv[1]) * tick - py
+        rz = tp[2] + (tv[2] - sv[2]) * tick - mz
+        byaw = math.atan2(ry, rx)
+        bpitch = math.atan2(rz, max(1.0, math.hypot(rx, ry)))
+        syaw = cur[0] + max(-turn, min(turn, wrap(aim_yaw - cur[0])))
+        spitch = cur[1] + max(-prate, min(prate, aim_pitch - cur[1]))
+        return all(abs(wrap(y - byaw)) < tol and abs(p - bpitch) < pitch_tol
+                   for y, p in ((cur[0], cur[1]), (syaw, spitch)))
 
     def _mortar_solve(self, st, tp, tv, vis):
         px, py, pz = self.pos
