@@ -236,12 +236,13 @@ class Sim:
             if not self.grounded:
                 sp = min(sp, 9.0)
             dx, dy = mv[0] * sp * 0.1, mv[1] * sp * 0.1
-            moved = True
+            # Report displacement after wall sliding, including blocked axes.
+            start_pos = list(self.pos)
             for _ in range(2):
                 if ml > 0.05:
-                    moved = self.try_move(dx / 2, dy / 2) and moved
+                    self.try_move(dx / 2, dy / 2)
                 self.vertical(act, 0.05)
-            self.vel = [dx * 10, dy * 10, 0] if moved else [0, 0, 0]
+            self.vel = [(end - start) * 10 for start, end in zip(start_pos, self.pos)]
             # aim slew
             a = act.get("aim", self.aim)
             dyaw = (a[0] - self.aim[0] + math.pi) % math.tau - math.pi
@@ -305,7 +306,9 @@ class Sim:
             elif t - self.last_dmg > 5:
                 self.hp = min(self.maxhp, self.hp + 4.5)
             # stuck stat: commanded movement but no progress for 3 s
-            if idle_pos is None or math.hypot(self.pos[0] - idle_pos[0], self.pos[1] - idle_pos[1]) > 3:
+            # A stationary hold ends the movement window. Otherwise the first
+            # step after camping for three seconds falsely counts as stuck.
+            if ml <= 0.5 or idle_pos is None or math.dist(self.pos, idle_pos) > 3:
                 idle_pos, idle_t = list(self.pos), t
             elif ml > 0.5 and t - idle_t > 3:
                 self.stats["stuck_events"] += 1

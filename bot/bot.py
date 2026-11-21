@@ -103,8 +103,8 @@ class Bot:
     # ================================================================== main
     def act(self, obs):
         t_start = time.perf_counter()
-        self.t_start = t_start
-        self.deadline = t_start + 0.016
+        # Leave time for combat, serialization and the wrapper after navigation.
+        self.deadline = t_start + 0.005
         self.obs = obs
         me = obs["self"]
         self.t = t = float(obs["t"])
@@ -173,6 +173,9 @@ class Bot:
                 if e.get("by") is not None:
                     self.dmg_log.append((t, float(e.get("amount", 0)), e.get("by"), e.get("bearing")))
                     self.dmg_by[e["by"]] = t
+            elif ty == "kill":
+                # A dead focus target must not absorb decisions from tracking memory.
+                self.enemies.pop(e["target"], None)
             elif ty == "hit":
                 self.last_hit = t
             elif ty == "take_failed":
@@ -198,17 +201,20 @@ class Bot:
             del self.enemies[k]
 
     # ================================================================== threat model
-    def _dps(self, weapons, d):
+    def _dps(self, weapons, d, own=False):
         dps = 0.0
         for w in weapons:
-            if w == "gun" and d < 230:
-                dps += 110 * (1.0 if d < 120 else 0.6)
-            elif w == "laser" and d < 280:
-                dps += 125
-            elif w == "lightning" and d < 55:
-                dps += 230
-            elif w == "mortar" and 25 < d < 235:
-                dps += 60
+            # Use upgraded slot stats for us and the live base weapon for opponents.
+            st = self.slots[w][1]["stats"] if own else self.W.get(w, {})
+            if w == "gun" and d <= st["range"]:
+                cycle = st["mag"] * st["cooldown"] + st["reload"]
+                dps += st["damage"] * st["mag"] / cycle
+            elif w == "laser" and d <= st["range"]:
+                dps += st["damage"] / (st["charge"] + st["cooldown"])
+            elif w == "lightning" and d <= st["range"]:
+                dps += st["damage"] / st["cooldown"]
+            elif w == "mortar" and st["splash_radius"] * 2 < d < st["speed"] ** 2 / st["gravity"]:
+                dps += st["splash"] / st["cooldown"]
         return dps
 
     def _assess(self, obs):
@@ -228,19 +234,22 @@ class Bot:
             hpf = e.get("hp", 1400) / max(1.0, e.get("max_hp", 1400))
             weps = e.get("weapons") or ["gun"]
             dps = self._dps(weps, d)
+            # The server tracks enemies through walls for vision.memory_s.
+            # Count open firing lanes once and reuse them for target selection.
+            size = 1 + self.cfg["cubes"]["size_per_cube"] * e.get("cubes", 0)
+            vis = self.wm.los(px, py, pz + self.stats["muzzle_height"], ex, ey,
+                              ez + self.cfg["mech"]["height"] * size / 2)
             threat = dps * (1.6 if targeting else 0.5) * (0.5 + 0.5 * hpf) * (1.0 if age < 1 else 0.6)
-            engaged = (age < 3.0) and (hit_me or (targeting and d < 220) or d < 70)
+            engaged = vis and (age < 3.0) and (hit_me or (targeting and d < 220) or d < 70)
             out.append({"id": eid, "e": e, "d": d, "age": age, "targeting": targeting, "hit_me": hit_me,
                         "hpf": hpf, "hp": e.get("hp", 1400), "threat": threat, "engaged": engaged, "weps": weps,
-                        "charging": bool(e.get("charging")) and age < 0.5, "aim_err": aim_err})
+                        "size": size, "vis": vis, "charging": bool(e.get("charging")) and vis and age < 0.5, "aim_err": aim_err})
         out.sort(key=lambda x: -x["threat"])
         return out
 
     def _my_dps(self, d):
-        dps = 0.0
-        for k, (i, w) in self.slots.items():
-            dps += self._dps([k], d)
-        return dps * (1 + 0.04 * min(self.me.get("cubes", 0), 10))
+        cubes = self.cfg["cubes"]
+        return self._dps(self.slots, d, own=True) * (1 + cubes["damage_per_cube"] * min(self.me.get("cubes", 0), cubes["stat_cap"]))
 
     # ================================================================== zone
     def _circle_at(self, z, t):
@@ -281,6 +290,9 @@ class Bot:
             f = 0.5
             bx, by = nc[0] + (cc[0] - nc[0]) * f * 0.3, nc[1] + (cc[1] - nc[1]) * f * 0.3
         wm = self.wm
+        # The last circle contracts to one point. Sampling around it wastes HP.
+        if nr == 0:
+            return nc
         best, bs = None, -1e9
         rad = max(6.0, min(36.0, nr * 0.35))
         nf = wm.nearest_free(px, py, 4)
@@ -350,8 +362,8 @@ class Bot:
             # seconds for them to kill us vs. for us to kill the main target (accuracy cancels roughly)
             their_dps = sum(max(40.0, self._dps(e["weps"], e["d"])) for e in engaged)
             ttk_me = me["hp"] / their_dps
-            main = engaged[0]
-            ttk_them = main["hp"] / max(40.0, self._my_dps(main["d"]))
+            # Compare our survival window with the quickest available finish.
+            ttk_them = min(e["hp"] / max(40.0, self._my_dps(e["d"])) for e in engaged)
             if (self.hpf < 0.35 or ttk_me < ttk_them * 0.45 or (n_eng >= 3 and self.hpf < 0.6)
                     or (n_eng >= 2 and self.hpf < 0.45)):
                 retreat = True
@@ -361,6 +373,14 @@ class Bot:
 
         if zone_urgent and (not engaged or not in_zone or eta < need):
             self.mode = "ZONE"
+            # An uncontested rotation can spend more of the tick on long routes.
+            if not threats:
+                self.deadline += 0.003
+            # Brake on approach instead of boosting back and forth across a tiny ring.
+            if nr == 0 and d_safe < 4 and self.wm.walk_line(*p[:2], *safe):
+                dt = self.cfg["match"]["decide_every"] / self.cfg["match"]["tick_hz"]
+                step = max(walk * dt, d_safe)
+                return ((safe[0] - p[0]) / step, (safe[1] - p[1]) / step), False, False, "zone-center"
             mv = self._navigate(safe)
             if not in_zone and mv == (0.0, 0.0):
                 c, r = self._circle_at(z, t + 1)
@@ -375,6 +395,15 @@ class Bot:
 
         if engaged:
             self.mode = "FIGHT"
+            # Arm the empty slot while shooting if the detour is short and walkable.
+            if len(self.slots) == 1 and n_eng == 1:
+                nearby = [pk for pk in obs.get("pickups", []) if pk["kind"] not in self.slots
+                          and dist2(p, pk["pos"]) < walk * 1.5 and abs(pk["pos"][2] - p[2]) <= 4
+                          and t - self.bad_pickups.get(pk["id"], -99) > 5
+                          and self.wm.walk_line(*p[:2], *pk["pos"][:2])]
+                if nearby:
+                    pk = max(nearby, key=lambda item: WEAPON_VALUE.get(item["kind"], 0) / (1 + dist2(p, item["pos"]) / walk))
+                    return self._navigate(pk["pos"], arrive=self.pickup_r * 0.75), False, False, "fight-equip"
             gun = self.slots.get("gun")
             other_ready = any(k in self.slots and self.slots[k][1].get("cooldown", 0) <= 0.3 for k in ("laser", "lightning", "mortar"))
             if gun and gun[1].get("reload", 0) > 0.5 and not other_ready:
@@ -387,6 +416,9 @@ class Bot:
         recent = [e for e in threats if e["age"] < 6 and e["d"] < 200]
         if self.hpf < 0.7 and recent:
             self.mode = "RECOVER"
+            # Once the wall breaks contact, stay put while regen runs.
+            if me.get("in_zone", True) and all(not e["vis"] for e in recent) and t - self.last_hurt > 0.5:
+                return (0.0, 0.0), False, False, "recover-covered"
             spot = self._hide_spot(recent, z)
             if spot:
                 return self._navigate(spot), False, False, "recover"
@@ -622,9 +654,12 @@ class Bot:
             self.path = None
             self.job = None
             return unit(gx - px, gy - py)
-        replan = (self.path_goal is None or math.hypot(self.path_goal[0] - gx, self.path_goal[1] - gy) > 6
-                  or self.t - self.path_t > 4.0)
-        if replan and (self.job is None or self.job.done or self.t - self.path_t > 4.0):
+        goal_changed = self.path_goal is None or dist2(self.path_goal, goal) > 6
+        # Finish a time-sliced search for the same goal; a stale path's
+        # refresh timer must not repeatedly discard unfinished work.
+        if self.job is None or goal_changed or (self.job.done and self.t - self.path_t > 4.0):
+            if goal_changed or self.path_t < 0:
+                self.path = None
             s = wm.idx(px, py)
             g = wm.idx(gx, gy)
             if not wm.free[g] and not wm.solid[g]:
@@ -633,7 +668,7 @@ class Bot:
             self.path_goal = (gx, gy)
             self.path_t = self.t
         if self.job is not None and not self.job.done:
-            if self.job.step(4000, deadline=self.t_start + 0.010):
+            if self.job.step(4000, deadline=self.deadline):
                 end = self.job.path[-1]
                 ex, ey = wm.center(end)
                 if math.hypot(ex - gx, ey - gy) > 8 and self.job.climb < 40:
@@ -779,8 +814,7 @@ class Bot:
             d = e["d"]
             if d > 285:
                 continue
-            ep = e["e"]["pos"]
-            vis = self.wm.los(px, py, mz, ep[0], ep[1], ep[2] + 4.5)
+            vis = e["vis"]
             # seconds to kill it (with a hit-probability falloff by range): finish the weakest first
             hitp = 1.0 / (1.0 + (d / 130.0) ** 2)
             ttk = e["hp"] / (max(40.0, self._my_dps(d)) * hitp)
@@ -794,7 +828,7 @@ class Bot:
             if not vis:
                 s -= 60.0
             if s > best:
-                best, tgt = s, dict(e, vis=vis)
+                best, tgt = s, e
         should = False
         if tgt is not None:
             should = (tgt["engaged"] or tgt["d"] < 80 or
@@ -802,6 +836,8 @@ class Bot:
                       (self.hpf > 0.85 and tgt["hpf"] < 0.6 and tgt["d"] < 120) or
                       (obs.get("alive", 16) <= 3 and self.hpf > 0.5))
             should = should or (tgt["d"] < 180 and self.hpf > 0.55)
+            if self.mode == "RECOVER" and not tgt["engaged"]:
+                should = False  # outgoing damage would restart the regen delay
             if not tgt["vis"] and "mortar" not in self.slots:
                 should = should and tgt["d"] < 60
             if should and tgt["vis"]:
@@ -811,9 +847,16 @@ class Bot:
             farm = self._npc_attacker(obs)
             if farm is None and self.mode in ("LOOT", "HOLD"):
                 farm = self._farm_target(obs)
+        # A tracked opponent behind a wall cannot justify exposing rear armor
+        # to a fresh damage bearing. The legs keep following their current goal.
+        if self.dmg_log and (tgt is None or not tgt["vis"]):
+            when, _, attacker, bearing = self.dmg_log[-1]
+            if bearing is not None and self.t - when < 1 and (tgt is None or attacker != tgt["id"]):
+                return [bearing, 0.0], fire, reload
         if tgt is not None and (should or farm is None):
-            info = {"pos": tgt["e"]["pos"], "vel": tgt["e"].get("vel", [0, 0, 0]), "h": 4.5 * (1 + 0.05 * tgt["e"].get("cubes", 0)),
-                    "r": 2.5 * (1 + 0.05 * tgt["e"].get("cubes", 0)), "vis": tgt["vis"]}
+            size = tgt["size"]
+            info = {"pos": tgt["e"]["pos"], "vel": tgt["e"].get("vel", [0, 0, 0]), "h": self.cfg["mech"]["height"] * size / 2,
+                    "r": self.cfg["mech"]["radius"] * size, "vis": tgt["vis"]}
             aim, fire, reload = self._shoot(info, should)
             return aim, fire, reload
         if farm is not None:
@@ -869,8 +912,11 @@ class Bot:
         rx, ry, rz = tp[0] - origin[0], tp[1] - origin[1], tp[2] - origin[2]
         vx, vy, vz = tv
         a = vx * vx + vy * vy + vz * vz - speed * speed
-        b = 2 * (rx * vx + ry * vy + rz * vz)
-        c = rx * rx + ry * ry + rz * rz
+        # Flight starts ahead of the muzzle along the aim ray:
+        # |relative_position + velocity * t| = barrel_offset + speed * t.
+        offset = self.stats.get("radius", self.cfg["mech"]["radius"] * self.scale) + 0.5
+        b = 2 * (rx * vx + ry * vy + rz * vz - offset * speed)
+        c = rx * rx + ry * ry + rz * rz - offset * offset
         tt = None
         if abs(a) < 1e-6:
             tt = -c / b if b != 0 else None
@@ -881,8 +927,8 @@ class Bot:
                 cands = [x for x in ((-b - sq) / (2 * a), (-b + sq) / (2 * a)) if x > 0]
                 tt = min(cands) if cands else None
         if tt is None:
-            tt = math.sqrt(c) / speed
-        tt = min(tt, 2.0)
+            tt = max(0.0, math.sqrt(max(0, c + offset * offset)) - offset) / speed
+        tt = max(0, min(tt, 2.0))
         return (tp[0] + vx * tt, tp[1] + vy * tt, tp[2] + vz * tt), tt
 
     def _shoot(self, info, should, farm=False):
@@ -891,8 +937,6 @@ class Bot:
         mz = pz + self.stats.get("muzzle_height", 7.0)
         tp = (info["pos"][0], info["pos"][1], info["pos"][2] + info["h"])
         tv = info["vel"]
-        tvz = tv[2] if abs(tv[2]) < 15 else 0.0
-        tv = (tv[0], tv[1], tvz * 0.5)
         d = math.hypot(tp[0] - px, tp[1] - py)
         cur = me["aim"]
         fire = [False, False]
@@ -906,7 +950,7 @@ class Bot:
         lp, tt = self._lead((px, py, mz), tp, tv, speed)
         aim_yaw = math.atan2(lp[1] - py, lp[0] - px)
         aim_pitch = math.atan2(lp[2] - mz, max(1.0, math.hypot(lp[0] - px, lp[1] - py)))
-        tol = math.atan2(info["r"] * 0.8, max(d, 1.0)) + 0.004
+        tol = math.atan2(info["r"] * 0.8, max(d, 1.0))
         mode = "gun"
         # laser: once charged, aim for the beam (hitscan) and release when on target
         if laser and should and not farm:
@@ -934,13 +978,15 @@ class Bot:
         # error between our actual torso aim and the solution
         yaw_err = abs(wrap(cur[0] - aim_yaw))
         pitch_err = abs(cur[1] - aim_pitch)
-        on = yaw_err < tol and pitch_err < tol * 1.5 + 0.01
+        # Both angles must fit the observed target, including at point-blank range.
+        pitch_tol = math.atan2(info["h"] * 0.8, max(d, 1.0))
+        on = yaw_err < tol and pitch_err < pitch_tol
         if should:
             if gun and info["vis"] and d < gun[1]["stats"].get("range", 230) and mode == "gun":
                 gw = gun[1]
                 if gw.get("ammo", 1) > 0 and gw.get("reload", 0) == 0:
                     # direct check of where the bullet goes now (current aim) vs the lead point
-                    if on or (yaw_err < tol * 1.6 and d < 40):
+                    if on:
                         fire[gun[0]] = True
             if use_mortar and yaw_err < 0.03 and pitch_err < 0.02:
                 fire[mortar[0]] = True
@@ -948,9 +994,10 @@ class Bot:
                 li, lw = light
                 st = lw["stats"]
                 rng = st.get("range", 45)
-                cone = math.radians(st.get("cone_deg", 30)) * 0.5
+                # The configured cone is the allowed yaw error on either side.
+                cone = math.radians(st["cone_deg"])
                 dy = abs(wrap(cur[0] - math.atan2(tp[1] - py, tp[0] - px)))
-                if d < rng * 0.95 and dy < cone * 0.85 and info["vis"] and lw.get("cooldown", 0) <= 0 \
+                if d < rng and dy < cone and info["vis"] and lw.get("cooldown", 0) < self.cfg["match"]["decide_every"] / self.cfg["match"]["tick_hz"] \
                         and me["energy"] >= st.get("energy", 3) + 6:
                     fire[li] = True
             if laser and not farm:
@@ -987,7 +1034,8 @@ class Bot:
         px, py, pz = self.pos
         v = st.get("speed", 72)
         g = st.get("gravity", 22)
-        lz = pz + self.stats.get("height", 9) * self.scale + 0.5
+        # Reported height already includes the mech's cubes.
+        lz = pz + self.stats.get("height", self.cfg["mech"]["height"] * self.scale) + 0.5
         aim_p = tp
         sol = None
         for _ in range(3):

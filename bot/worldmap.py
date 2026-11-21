@@ -387,7 +387,8 @@ class PathJob:
         nbs = ((1, 1.0), (-1, 1.0), (NX, 1.0), (-NX, 1.0), (NX + 1, SQ2), (NX - 1, SQ2), (-NX + 1, SQ2), (-NX - 1, SQ2))
         n = 0
         while openl and n < budget:
-            if deadline is not None and (n & 127) == 127 and clock() >= deadline:
+            # Check on entry too: another planner may have spent this tick's budget.
+            if deadline is not None and (n & 31) == 0 and clock() >= deadline:
                 break
             f, gc, cur = pop(openl)
             if cur in closed:
