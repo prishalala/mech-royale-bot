@@ -405,8 +405,7 @@ class Bot:
                     pk = max(nearby, key=lambda item: WEAPON_VALUE.get(item["kind"], 0) / (1 + dist2(p, item["pos"]) / walk))
                     return self._navigate(pk["pos"], arrive=self.pickup_r * 0.75), False, False, "fight-equip"
             gun = self.slots.get("gun")
-            other_ready = any(k in self.slots and self.slots[k][1].get("cooldown", 0) <= 0.3 for k in ("laser", "lightning", "mortar"))
-            if gun and gun[1].get("reload", 0) > 0.5 and not other_ready:
+            if gun and gun[1].get("reload", 0) > 0.5 and not self._reload_support(engaged):
                 spot = self._hide_spot(engaged, z)
                 if spot and dist2(p, spot) < 22:
                     return self._navigate(spot, arrive=1.5), False, False, "fight-reload"
@@ -436,6 +435,20 @@ class Bot:
         if d_safe < 25 and not recently_hurt:
             mv = (mv[0] * 0.4, mv[1] * 0.4)
         return mv, False, False, "pos"
+
+    def _reload_support(self, engaged):
+        """Can a secondary weapon support staying exposed during this reload?"""
+        for kind, (_, weapon) in self.slots.items():
+            if kind == "gun" or weapon.get("cooldown", 0) > 0.3:
+                continue
+            if kind in ("laser", "mortar"):
+                return True
+            # Engaged enemies already have line of sight. An arc with no
+            # target in range or too little energy cannot cover a reloading gun.
+            if kind == "lightning" and self.me["energy"] >= weapon["stats"]["energy"] + 6:
+                if any(e["d"] < weapon["stats"]["range"] for e in engaged):
+                    return True
+        return False
 
     def _away(self, engaged):
         px, py = self.pos[0], self.pos[1]
