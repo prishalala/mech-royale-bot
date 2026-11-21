@@ -35,7 +35,8 @@ def unit(dx, dy):
     return dx / d, dy / d
 
 
-WEAPON_VALUE = {"lightning": 3.2, "laser": 3.0, "mortar": 1.2, "gun": 0.0}
+# Laser-first: the beam (hitscan, 280 m) plus the gun is our best tool at medium range.
+WEAPON_VALUE = {"laser": 4.0, "lightning": 3.2, "mortar": 1.2, "gun": 0.0}
 
 # Upgrade preference for a survival bot. Unknown ids fall back to effect-based scoring.
 UPGRADE_SCORE = {
@@ -98,6 +99,7 @@ class Bot:
         self.bad_crates = set()
         self.focus_id = None
         self.focus_t = -99.0
+        self.seen_lasers = {}   # pickup id -> (pickup, time seen): lasers stay put out of view
         log(f"bot init {1000 * (time.perf_counter() - t0):.0f} ms, map ok={self.wm.ok}")
 
     # ================================================================== main
@@ -121,6 +123,12 @@ class Bot:
         self._events(obs)
         self._sounds(obs)
         self._track(obs)
+        for pk in obs.get("pickups") or []:
+            if pk.get("kind") == "laser":
+                self.seen_lasers[pk["id"]] = (pk, t)
+        vis_ids = {pk["id"] for pk in obs.get("pickups") or []}
+        self.seen_lasers = {i: v for i, v in self.seen_lasers.items()
+                            if t - v[1] < 20 and (i in vis_ids or dist2(self.pos, v[0]["pos"]) > self.pickup_r + 2)}
         if obs.get("offer"):
             act["pick"] = self._pick_upgrade(obs["offer"])
 
@@ -367,6 +375,13 @@ class Bot:
             if (self.hpf < 0.35 or ttk_me < ttk_them * 0.45 or (n_eng >= 3 and self.hpf < 0.6)
                     or (n_eng >= 2 and self.hpf < 0.45)):
                 retreat = True
+            # laser in hand and the target within one beam + ~2 s of gun: finish it
+            lz = self.slots.get("laser")
+            if lz and n_eng == 1 and self.hpf > 0.3:
+                tg = engaged[0]
+                beam = lz[1]["stats"].get("damage", 315) if lz[1].get("cooldown", 0) < 1.0 and tg["d"] < lz[1]["stats"].get("range", 280) else 0.0
+                if tg["hp"] <= beam + 2.0 * (self._dps(["gun"], tg["d"], own=True) if "gun" in self.slots else 0.0):
+                    retreat = False
             # cornered at very close range: fighting beats turning our back
             if engaged[0]["d"] < 18 and self.hpf > 0.25 and n_eng == 1:
                 retreat = False
@@ -396,6 +411,15 @@ class Bot:
         if engaged:
             self.mode = "FIGHT"
             # Arm the empty slot while shooting if the detour is short and walkable.
+            lightning_rng = self.W.get("lightning", {}).get("range", 45)
+            if ("laser" not in self.slots and n_eng == 1 and engaged[0]["d"] > lightning_rng
+                    and WEAPON_VALUE["laser"] > (self._wval(next((k for k in self.slots if k != "gun"), None)) if len(self.slots) > 1 else 0) + 0.5):
+                near_l = [pk for pk, _ in self.seen_lasers.values() if dist2(p, pk["pos"]) < 30
+                          and abs(pk["pos"][2] - p[2]) <= 4 and t - self.bad_pickups.get(pk["id"], -99) > 5
+                          and self.wm.walk_line(*p[:2], *pk["pos"][:2])]
+                if near_l:
+                    pk = min(near_l, key=lambda item: dist2(p, item["pos"]))
+                    return self._navigate(pk["pos"], arrive=self.pickup_r * 0.75), False, False, "fight-laser"
             if len(self.slots) == 1 and n_eng == 1:
                 nearby = [pk for pk in obs.get("pickups", []) if pk["kind"] not in self.slots
                           and dist2(p, pk["pos"]) < walk * 1.5 and abs(pk["pos"][2] - p[2]) <= 4
@@ -455,7 +479,7 @@ class Bot:
         if "lightning" in self.slots:
             pref = 28.0
         elif "laser" in self.slots:
-            pref = 110.0
+            pref = 120.0      # both gun and beam contribute here
         elif "mortar" in self.slots:
             pref = 100.0
         else:
@@ -544,6 +568,31 @@ class Bot:
             self.hide, self.hide_t = best, t
         return best
 
+    def _wval(self, kind):
+        v = WEAPON_VALUE.get(kind, 0.0)
+        if kind == "lightning" and "lightning" in self.slots:
+            rng = self.slots["lightning"][1]["stats"].get("range", 45)
+            near = any(e["age"] < 3 and e["d"] < rng * 1.2 for e in self.threats)
+            v = 5.0 if near else 2.0
+        return v
+
+    def _laser_cost(self, pk, spare):
+        """Seconds to go and equip a laser (None if not worth it / unreachable)."""
+        wm = self.wm
+        px, py, pz = self.pos
+        x, y, zz = pk["pos"]
+        d = math.hypot(x - px, y - py)
+        walk = self.stats.get("walk_speed", 11.7)
+        idx = wm.idx(x, y)
+        roof = zz - wm.ground[idx] > 3.0
+        if roof and d > 60:
+            return None             # climbing onto a roof is slow; only close ones
+        travel = d * 1.3 / walk + (3.0 if roof else 0.0)
+        equip = max(float(self.cfg.get("loot", {}).get("equip_s", 1)), self.W["laser"].get("cooldown", 1.65))
+        if travel + equip > spare - 6:
+            return None             # zone pressure
+        return travel + equip
+
     def _loot_goal(self, obs, threats, eta, need):
         """(x, y, what) worth walking to, or None."""
         t = self.t
@@ -560,13 +609,28 @@ class Bot:
         for k in self.slots:
             if k != "gun":
                 cur2 = k
-        cur_v = WEAPON_VALUE.get(cur2, 0.0) if cur2 else 0.0
+        cur_v = self._wval(cur2) if cur2 else 0.0
+        # A laser we can reach soon beats everything else on the floor.
+        if "laser" not in self.slots and WEAPON_VALUE["laser"] - cur_v >= 0.5:
+            for pk, seen in self.seen_lasers.values():
+                if pk["id"] in self.bad_pickups and t - self.bad_pickups[pk["id"]] < 5:
+                    continue
+                cost = self._laser_cost(pk, spare)
+                if cost is None or (danger_near and cost > 5.0):
+                    continue        # with a hunter near, only lasers we can grab almost at once
+                s = (WEAPON_VALUE["laser"] - cur_v) * 30 / (1 + cost / 4.0)
+                if danger_near:
+                    s *= 0.6
+                if s > bs:
+                    bs, best = s, (pk["pos"][0], pk["pos"][1], "laser")
         for pk in obs.get("pickups") or []:
             if pk["id"] in self.bad_pickups and t - self.bad_pickups[pk["id"]] < 5:
                 continue
             kind = pk.get("kind")
             if kind in self.slots:
                 continue
+            if kind == "laser":
+                continue                # handled above with travel/equip/zone costs
             gain = WEAPON_VALUE.get(kind, 0) - cur_v
             if gain < 0.5:
                 continue
@@ -950,6 +1014,7 @@ class Bot:
         lp, tt = self._lead((px, py, mz), tp, tv, speed)
         aim_yaw = math.atan2(lp[1] - py, lp[0] - px)
         aim_pitch = math.atan2(lp[2] - mz, max(1.0, math.hypot(lp[0] - px, lp[1] - py)))
+        g_yaw, g_pitch = aim_yaw, aim_pitch     # gun lead, kept when the beam takes over the aim
         tol = math.atan2(info["r"] * 0.8, max(d, 1.0))
         mode = "gun"
         # laser: once charged, aim for the beam (hitscan) and release when on target
@@ -991,7 +1056,11 @@ class Bot:
         prate = self.stats.get("pitch_rate", mech["pitch_rate"]) * tick
         gun_on = yaw_err < tol + turn and pitch_err < pitch_tol + prate
         if should:
-            if gun and info["vis"] and d < gun[1]["stats"].get("range", 230) and mode == "gun":
+            # While the beam owns the aim, the gun still fires if that aim is also
+            # within the gun's tolerance of its own lead point (slow or radial targets).
+            gun_ok = mode == "gun" or (mode == "laser" and abs(wrap(aim_yaw - g_yaw)) < tol
+                                       and abs(aim_pitch - g_pitch) < pitch_tol)
+            if gun and info["vis"] and d < gun[1]["stats"].get("range", 230) and gun_ok:
                 gw = gun[1]
                 if gw.get("ammo", 1) > 0 and gw.get("reload", 0) == 0:
                     if gun_on:
@@ -1016,7 +1085,8 @@ class Bot:
                 rng = st.get("range", 280)
                 if charge > 0:
                     held_too_long = charge >= full + st.get("hold_s", 2.0) * 0.7
-                    if charge >= full and (on or held_too_long):
+                    if charge >= full and (self._beam_on(cur, aim_yaw, aim_pitch, tp, tv, tol, pitch_tol, turn, prate)
+                                           or held_too_long):
                         fire[li] = False   # release: fires now along our actual aim
                     elif not info["vis"] and charge >= full and yaw_err > 0.3:
                         fire[li] = False
@@ -1037,6 +1107,25 @@ class Bot:
         if laser and not fire[laser[0]] and (laser[1].get("charge", 0) or 0) > 0 and not should:
             fire[laser[0]] = (laser[1].get("charge", 0) or 0) < laser[1]["stats"].get("charge", 0.75)
         return [aim_yaw, aim_pitch], fire, reload
+
+    def _beam_on(self, cur, aim_yaw, aim_pitch, tp, tv, tol, pitch_tol, turn, prate):
+        """Will a laser released now hit? Letting go applies on the next tick, and the
+        protocol doesn't say whether the torso slews before or after it. So require a
+        hit both along the current aim and along the aim after one tick of slew toward
+        the command, against the target where it will be at release (relative motion)."""
+        tick = 1.0 / self.cfg["match"]["tick_hz"]
+        px, py, pz = self.pos
+        mz = pz + self.stats.get("muzzle_height", 7.0)
+        sv = self.me.get("vel") or (0.0, 0.0, 0.0)
+        rx = tp[0] + (tv[0] - sv[0]) * tick - px
+        ry = tp[1] + (tv[1] - sv[1]) * tick - py
+        rz = tp[2] + (tv[2] - sv[2]) * tick - mz
+        byaw = math.atan2(ry, rx)
+        bpitch = math.atan2(rz, max(1.0, math.hypot(rx, ry)))
+        syaw = cur[0] + max(-turn, min(turn, wrap(aim_yaw - cur[0])))
+        spitch = cur[1] + max(-prate, min(prate, aim_pitch - cur[1]))
+        return all(abs(wrap(y - byaw)) < tol and abs(p - bpitch) < pitch_tol
+                   for y, p in ((cur[0], cur[1]), (syaw, spitch)))
 
     def _mortar_solve(self, st, tp, tv, vis):
         px, py, pz = self.pos
@@ -1084,7 +1173,7 @@ class Bot:
                 continue
             if empty is not None and kind != "gun":
                 return {"take": pk["id"]}
-            if cur2 is not None and WEAPON_VALUE.get(kind, 0) > WEAPON_VALUE.get(cur2, 0) + 0.5:
+            if cur2 is not None and WEAPON_VALUE.get(kind, 0) > self._wval(cur2) + 0.5:
                 w = self.slots[cur2][1]
                 if cur2 == "laser" and (w.get("charge", 0) or 0) > 0:
                     continue
@@ -1106,6 +1195,8 @@ class Bot:
             return 0.5
         if uid in UPGRADE_SCORE:
             s = UPGRADE_SCORE[uid]
+            if "laser" in self.slots and uid in ("laser_damage", "laser_charge"):
+                s = 10.5 if uid == "laser_damage" else 10.3
         elif u:
             s = 1.0
             for ef in u.get("effects", []):
