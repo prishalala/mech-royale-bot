@@ -1,0 +1,7 @@
+.git/
+arena/
+check/
+python/
+ts/
+bot/tools/
+**/__pycache__/
