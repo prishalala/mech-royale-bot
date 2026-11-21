@@ -39,17 +39,17 @@ WEAPON_VALUE = {"lightning": 3.2, "laser": 3.0, "mortar": 1.2, "gun": 0.0}
 
 # Upgrade preference for a survival bot. Unknown ids fall back to effect-based scoring.
 UPGRADE_SCORE = {
-    "armor": 10.0, "plating": 9.5, "nanites": 8.5,
-    "gun_damage": 6.5, "gun_rate": 6.0, "laser_damage": 6.0, "laser_charge": 6.2,
-    "lightning_efficiency": 6.3, "lightning_range": 5.5, "servos": 5.0,
-    "gun_mag": 4.5, "capacitor": 4.0, "reactor": 4.0, "sensors": 4.2, "gyros": 3.5,
+    "gun_rate": 10.0, "gun_damage": 9.8, "armor": 9.5, "plating": 9.0, "nanites": 7.0,
+    "laser_damage": 8.0, "laser_charge": 8.2,
+    "lightning_efficiency": 8.0, "lightning_range": 6.0, "servos": 5.0,
+    "gun_mag": 6.5, "capacitor": 4.0, "reactor": 4.0, "sensors": 4.2, "gyros": 3.5,
     "jets": 3.0, "gun_velocity": 3.5, "lightning_chain": 3.0, "laser_pierce": 2.0,
     "mortar_reload": 2.5, "mortar_splash": 2.0, "mortar_velocity": 2.0,
 }
 
 
 class Bot:
-    name = "ironwall-survivor"
+    name = "ironwall-survivor-v2"
 
     def __init__(self, hello):
         t0 = time.perf_counter()
@@ -96,6 +96,8 @@ class Bot:
         self.mode = "start"
         self.bad_pickups = {}
         self.bad_crates = set()
+        self.focus_id = None
+        self.focus_t = -99.0
         log(f"bot init {1000 * (time.perf_counter() - t0):.0f} ms, map ok={self.wm.ok}")
 
     # ================================================================== main
@@ -350,7 +352,8 @@ class Bot:
             ttk_me = me["hp"] / their_dps
             main = engaged[0]
             ttk_them = main["hp"] / max(40.0, self._my_dps(main["d"]))
-            if self.hpf < 0.38 or ttk_me < ttk_them * 0.75 or (n_eng >= 2 and self.hpf < 0.75):
+            if (self.hpf < 0.35 or ttk_me < ttk_them * 0.45 or (n_eng >= 3 and self.hpf < 0.6)
+                    or (n_eng >= 2 and self.hpf < 0.45)):
                 retreat = True
             # cornered at very close range: fighting beats turning our back
             if engaged[0]["d"] < 18 and self.hpf > 0.25 and n_eng == 1:
@@ -372,6 +375,12 @@ class Bot:
 
         if engaged:
             self.mode = "FIGHT"
+            gun = self.slots.get("gun")
+            other_ready = any(k in self.slots and self.slots[k][1].get("cooldown", 0) <= 0.3 for k in ("laser", "lightning", "mortar"))
+            if gun and gun[1].get("reload", 0) > 0.5 and not other_ready:
+                spot = self._hide_spot(engaged, z)
+                if spot and dist2(p, spot) < 22:
+                    return self._navigate(spot, arrive=1.5), False, False, "fight-reload"
             return self._fight_move(engaged[0], z), False, False, "fight"
 
         # after a fight: if hurt, stay hidden to regenerate before doing anything else
@@ -772,7 +781,18 @@ class Bot:
                 continue
             ep = e["e"]["pos"]
             vis = self.wm.los(px, py, mz, ep[0], ep[1], ep[2] + 4.5)
-            s = e["threat"] + (1 - e["hpf"]) * 150 - d * 0.6 + (120 if e["hit_me"] else 0) + (0 if vis else -400)
+            # seconds to kill it (with a hit-probability falloff by range): finish the weakest first
+            hitp = 1.0 / (1.0 + (d / 130.0) ** 2)
+            ttk = e["hp"] / (max(40.0, self._my_dps(d)) * hitp)
+            s = -ttk
+            if e["id"] == self.focus_id and self.t - self.focus_t < 3.0:
+                s += 2.5 + 0.15 * ttk          # sticky: don't spread damage (they regen after 5 s)
+            if e["hit_me"]:
+                s += 1.0
+            elif e["targeting"]:
+                s += 0.5
+            if not vis:
+                s -= 60.0
             if s > best:
                 best, tgt = s, dict(e, vis=vis)
         should = False
@@ -781,8 +801,11 @@ class Bot:
                       (tgt["hpf"] < 0.4 and self.hpf > 0.5 and tgt["d"] < 160) or
                       (self.hpf > 0.85 and tgt["hpf"] < 0.6 and tgt["d"] < 120) or
                       (obs.get("alive", 16) <= 3 and self.hpf > 0.5))
+            should = should or (tgt["d"] < 180 and self.hpf > 0.55)
             if not tgt["vis"] and "mortar" not in self.slots:
                 should = should and tgt["d"] < 60
+            if should and tgt["vis"]:
+                self.focus_id, self.focus_t = tgt["id"], self.t
         farm = None
         if tgt is None or not should:
             farm = self._npc_attacker(obs)
